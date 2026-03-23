@@ -9,7 +9,7 @@ from typing import Dict
 import os
 import slixmpp
 from slixmpp import jid
-
+from aiohttp import web
 # ========== 基础配置 ==========
 BOT_JID = os.getenv("BOT_JID")
 BOT_PASSWORD = os.getenv("BOT_PASSWORD")
@@ -28,6 +28,19 @@ CLEAN_CACHE_TIME = 1800   # 更频繁清理
 MAX_USERS = 1000          # 防止内存爆
 MAX_MESSAGE_LENGTH = 500  # 限制消息长度
 
+
+# ===== 新增 HTTP Pin Server =====
+async def handle_ping(request):
+    return web.Response(text="ok")
+
+async def start_http_server():
+    app = web.Application()
+    app.add_routes([web.get("/ping", handle_ping)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8000)))  # Railway 用 PORT 环境变量
+    await site.start()
+    print(f"✅ HTTP pin server running on port {os.getenv('PORT', 8000)}")
 # ========== 用户状态 ==========
 class UserInfo:
     __slots__ = ("msg_times", "last_msg", "repeat_count")
@@ -201,22 +214,23 @@ if __name__ == "__main__":
         level=logging.WARNING,
         format="%(asctime)s %(levelname)s: %(message)s"
     )
+    loop = asyncio.get_event_loop()
 
-    while True:
-        try:
-            xmpp = AntiSpamBot()
-            xmpp.register_plugin("xep_0030")
-            xmpp.register_plugin("xep_0045")
+    async def main():
+        # 启动 HTTP pin server
+        await start_http_server()
 
-            if xmpp.connect():
-                xmpp.loop.run_forever()
-            else:
-                logging.error("连接失败")
+        while True:
+            try:
+                xmpp = AntiSpamBot()
+                xmpp.register_plugin("xep_0030")
+                xmpp.register_plugin("xep_0045")
+                if xmpp.connect():
+                    await xmpp.process(forever=True)  # 异步方式取代 run_forever
+                else:
+                    logging.error("连接失败")
+            except Exception as e:
+                logging.error(f"主循环异常: {e}")
+            await asyncio.sleep(5)
 
-        except KeyboardInterrupt:
-            break
-
-        except Exception as e:
-            logging.error(f"主循环异常: {e}")
-
-        time.sleep(5)
+    loop.run_until_complete(main())
