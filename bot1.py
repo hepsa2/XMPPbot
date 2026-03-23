@@ -81,29 +81,39 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         self["xep_0199"].enable_keepalive(interval=60, timeout=10)
 
     async def start(self, event):
+        self.send_presence()
+
+        # roster 请求加超时
         try:
-            self.send_presence()
-            # roster 请求加超时
-            try:
-                await asyncio.wait_for(self.get_roster(), timeout=30)
-            except asyncio.TimeoutError:
-                logging.warning("⚠ Roster 请求超时")
+            await asyncio.wait_for(self.get_roster(), timeout=30)
+        except asyncio.TimeoutError:
+            logging.warning("⚠ Roster 请求超时")
 
-            await asyncio.sleep(2)  # 延迟保证 session 建立
+        await asyncio.sleep(2)  # 延迟保证 session 建立
 
-            # MUC join 超时控制
+        # MUC join 自动重试
+        joined = False
+        for attempt in range(5):
             try:
                 await asyncio.wait_for(
                     self.plugin["xep_0045"].join_muc(ROOM_JID, ROOM_NICK),
-                    timeout=30
+                    timeout=15
                 )
+                joined = True
+                logging.warning("✅ Bot 已上线")
+                break
             except asyncio.TimeoutError:
-                logging.warning("⚠ MUC join 超时，稍后会自动重试")
+                logging.warning(f"⚠ MUC join 超时，第 {attempt + 1} 次重试")
+                await asyncio.sleep(5)
+            except Exception as e:
+                logging.error(f"加入群聊异常: {e}")
+                await asyncio.sleep(5)
 
-            asyncio.create_task(self.clean_cache())
-            logging.warning("✅ Bot 已上线")
-        except Exception as e:
-            logging.error(f"MUC join 或 roster 异常: {e}")
+        if not joined:
+            logging.error("❌ Bot 未能加入群聊，稍后主循环会重试")
+
+        # 启动缓存清理
+        asyncio.create_task(self.clean_cache())
 
     async def on_message(self, msg):
         if msg["from"].bare != ROOM_JID:
@@ -112,16 +122,13 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         if not nick or nick == ROOM_NICK:
             return
         body = msg["body"]
-        if not body:
-            return
-        if len(body) > MAX_MESSAGE_LENGTH:
+        if not body or len(body) > MAX_MESSAGE_LENGTH:
             return
 
         user_jid = self.get_user_jid(ROOM_JID, nick)
         if not user_jid:
             return
 
-        # 限制用户缓存
         if len(self.users) > MAX_USERS:
             self.users.clear()
 
