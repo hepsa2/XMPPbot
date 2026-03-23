@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Railway XMPP 反刷屏机器人
-# 保持原功能 + 增强稳定性 / 内存控制 / 自动重连
+# 功能：反刷屏 + HTTP Pin Server + 自动重连 + 稳定性增强
 
 import asyncio
 import time
@@ -23,11 +23,11 @@ MAX_REPEAT_COUNT = 4
 FAST_INTERVAL = 5
 MIN_SPAM_LENGTH = 4
 MAX_SPAM_COUNT = 5
-CLEAN_CACHE_TIME = 1800   # 缓存清理间隔
-MAX_USERS = 1000          # 防止内存爆
-MAX_MESSAGE_LENGTH = 500  # 限制消息长度
+CLEAN_CACHE_TIME = 1800
+MAX_USERS = 1000
+MAX_MESSAGE_LENGTH = 500
 
-# ===== 新增 HTTP Pin Server =====
+# ===== HTTP Pin Server =====
 async def handle_ping(request):
     return web.Response(text="ok")
 
@@ -41,7 +41,7 @@ async def start_http_server():
     await site.start()
     print(f"✅ HTTP pin server running on port {port}")
 
-# ========== 用户状态 ==========
+# ===== 用户状态 =====
 class UserInfo:
     __slots__ = ("msg_times", "last_msg", "repeat_count")
     def __init__(self):
@@ -49,7 +49,7 @@ class UserInfo:
         self.last_msg = ""
         self.repeat_count = 0
 
-# ========== 单条消息刷屏检测 ==========
+# ===== 单条消息刷屏检测 =====
 def has_spam_pattern(text: str) -> bool:
     if len(text) < MIN_SPAM_LENGTH * MAX_SPAM_COUNT:
         return False
@@ -63,7 +63,7 @@ def has_spam_pattern(text: str) -> bool:
                 return True
     return False
 
-# ========== 机器人 ==========
+# ===== 机器人类 =====
 class AntiSpamBot(slixmpp.ClientXMPP):
     def __init__(self):
         super().__init__(BOT_JID, BOT_PASSWORD)
@@ -76,21 +76,30 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         self.add_event_handler("disconnected", self.on_disconnect)
         self.add_event_handler("failed_auth", self.on_failed_auth)
 
-        # keepalive
+        # Keepalive
         self.register_plugin("xep_0199")
         self["xep_0199"].enable_keepalive(interval=60, timeout=10)
 
     async def start(self, event):
         try:
             self.send_presence()
-            await self.get_roster(timeout=30)  # 增加 roster 超时
-            # 延迟加入群聊，避免 join 失败
-            await asyncio.sleep(2)
-            await self.plugin["xep_0045"].join_muc(
-                ROOM_JID,
-                ROOM_NICK,
-                timeout=30
-            )
+            # roster 请求加超时
+            try:
+                await asyncio.wait_for(self.get_roster(), timeout=30)
+            except asyncio.TimeoutError:
+                logging.warning("⚠ Roster 请求超时")
+
+            await asyncio.sleep(2)  # 延迟保证 session 建立
+
+            # MUC join 超时控制
+            try:
+                await asyncio.wait_for(
+                    self.plugin["xep_0045"].join_muc(ROOM_JID, ROOM_NICK),
+                    timeout=30
+                )
+            except asyncio.TimeoutError:
+                logging.warning("⚠ MUC join 超时，稍后会自动重试")
+
             asyncio.create_task(self.clean_cache())
             logging.warning("✅ Bot 已上线")
         except Exception as e:
@@ -105,28 +114,33 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         body = msg["body"]
         if not body:
             return
-        # ===== 限制消息长度 =====
         if len(body) > MAX_MESSAGE_LENGTH:
             return
+
         user_jid = self.get_user_jid(ROOM_JID, nick)
         if not user_jid:
             return
-        # ===== 限制用户缓存 =====
+
+        # 限制用户缓存
         if len(self.users) > MAX_USERS:
             self.users.clear()
+
         info = self.users.setdefault(user_jid, UserInfo())
         now = time.time()
-        # ===== 单条消息刷屏 =====
+
+        # 单条消息刷屏
         if has_spam_pattern(body):
             await self.kick(user_jid, nick, "单条消息刷屏")
             return
-        # ===== 频率检测 =====
+
+        # 频率检测
         info.msg_times = [t for t in info.msg_times if now - t < FAST_INTERVAL]
         info.msg_times.append(now)
         if len(info.msg_times) >= MAX_FREQ_COUNT:
             await self.kick(user_jid, nick, "发送过快")
             return
-        # ===== 连续重复 =====
+
+        # 连续重复检测
         if body == info.last_msg:
             info.repeat_count += 1
         else:
@@ -138,15 +152,10 @@ class AntiSpamBot(slixmpp.ClientXMPP):
     async def kick(self, user_jid: str, nick: str, reason: str):
         try:
             await self.plugin["xep_0045"].set_role(
-                ROOM_JID,
-                nick,
-                role="none",
-                reason=reason
+                ROOM_JID, nick, role="none", reason=reason
             )
             await self.plugin["xep_0045"].set_affiliation(
-                ROOM_JID,
-                "outcast",
-                jid=user_jid
+                ROOM_JID, "outcast", jid=user_jid
             )
             self.send_message(
                 mto=ROOM_JID,
@@ -178,30 +187,27 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         logging.error("❌ 登录失败")
         self.disconnect()
 
-# ========== 主入口 ==========
+# ===== 主入口 =====
+async def run_bot():
+    await start_http_server()
+
+    while True:
+        try:
+            xmpp = AntiSpamBot()
+            xmpp.register_plugin("xep_0030")
+            xmpp.register_plugin("xep_0045")
+            connected = await asyncio.to_thread(xmpp.connect)
+            if connected:
+                await xmpp.process(forever=True)
+            else:
+                logging.error("连接失败")
+        except Exception as e:
+            logging.error(f"主循环异常: {e}")
+        await asyncio.sleep(5)  # 重连间隔
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(levelname)s: %(message)s"
     )
-
-    async def main():
-        # 启动 HTTP pin server
-        await start_http_server()
-
-        while True:
-            try:
-                xmpp = AntiSpamBot()
-                xmpp.register_plugin("xep_0030")
-                xmpp.register_plugin("xep_0045")
-                # 异步方式启动 bot
-                if await asyncio.to_thread(xmpp.connect):
-                    await xmpp.process(forever=True)
-                else:
-                    logging.error("连接失败")
-            except Exception as e:
-                logging.error(f"主循环异常: {e}")
-            await asyncio.sleep(5)
-
-    # 使用 asyncio.run 替代 get_event_loop()
-    asyncio.run(main())
+    asyncio.run(run_bot())
