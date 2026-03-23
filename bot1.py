@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-# Railway XMPP 反刷屏机器人
+# Railway XMPP 反刷屏机器人（修复版）
 # 功能：反刷屏 + HTTP Pin Server + 自动重连 + 稳定性增强
+# 修复点：使用 await xmpp.disconnected 代替 process(forever=True)
 
 import asyncio
 import time
@@ -89,7 +90,7 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         except asyncio.TimeoutError:
             logging.warning("⚠ Roster 请求超时")
 
-        await asyncio.sleep(2)  # 延迟保证 session 建立
+        await asyncio.sleep(2)
 
         # MUC join 自动重试
         joined = False
@@ -203,18 +204,18 @@ async def run_bot():
             xmpp = AntiSpamBot()
             xmpp.register_plugin("xep_0030")
             xmpp.register_plugin("xep_0045")
-            connected = await asyncio.to_thread(xmpp.connect)
-            if connected:
-                await xmpp.process(forever=True)
-            else:
-                logging.error("连接失败")
+
+            # 关键修复：同步 connect + 等待 disconnected Future
+            xmpp.connect()
+            await xmpp.disconnected  # 断开时自动继续（官方推荐方式）
+
         except Exception as e:
             logging.error(f"主循环异常: {e}")
         await asyncio.sleep(5)  # 重连间隔
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.WARNING,
+        level=logging.WARNING,  # 建议临时改成 INFO 看更多日志
         format="%(asctime)s %(levelname)s: %(message)s"
     )
     asyncio.run(run_bot())
