@@ -209,7 +209,7 @@ if __name__ == "__main__":
             xmpp.register_plugin("xep_0045")
 
             if xmpp.connect():
-                xmpp.process(forever=True)
+                xmpp.loop.run_forever()
             else:
                 logging.error("连接失败")
 
