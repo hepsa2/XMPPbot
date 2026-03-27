@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
-# Railway XMPP 反刷屏机器人（修复版）
+# Railway XMPP 反刷屏机器人（节能版）
 # 功能：反刷屏 + HTTP Pin Server + 自动重连 + 稳定性增强
-# 修复点：使用 await xmpp.disconnected 代替 process(forever=True)
+# 优化点：在保持原有结构、功能、上线机制完全不变的前提下，大幅降低内存占用
+#         1. msg_times 使用 deque + 滑动窗口（避免每次过滤创建临时列表）
+#         2. 缓存清理时强制 gc.collect()（解决长时间运行的内存缓慢增长）
+#         3. 其他逻辑、参数、事件处理、MUC上线流程完全一致
 
 import asyncio
 import time
 import logging
 from typing import Dict
 import os
+import gc
+from collections import deque
 import slixmpp
 from slixmpp import jid
 from aiohttp import web
@@ -42,15 +47,15 @@ async def start_http_server():
     await site.start()
     print(f"✅ HTTP pin server running on port {port}")
 
-# ===== 用户状态 =====
+# ===== 用户状态（节能优化：msg_times 使用 deque）=====
 class UserInfo:
     __slots__ = ("msg_times", "last_msg", "repeat_count")
     def __init__(self):
-        self.msg_times = []
+        self.msg_times = deque()          # 滑动窗口，内存更高效
         self.last_msg = ""
         self.repeat_count = 0
 
-# ===== 单条消息刷屏检测 =====
+# ===== 单条消息刷屏检测（逻辑完全不变）=====
 def has_spam_pattern(text: str) -> bool:
     if len(text) < MIN_SPAM_LENGTH * MAX_SPAM_COUNT:
         return False
@@ -64,7 +69,7 @@ def has_spam_pattern(text: str) -> bool:
                 return True
     return False
 
-# ===== 机器人类 =====
+# ===== 机器人类（结构完全不变）=====
 class AntiSpamBot(slixmpp.ClientXMPP):
     def __init__(self):
         super().__init__(BOT_JID, BOT_PASSWORD)
@@ -141,8 +146,9 @@ class AntiSpamBot(slixmpp.ClientXMPP):
             await self.kick(user_jid, nick, "单条消息刷屏")
             return
 
-        # 频率检测
-        info.msg_times = [t for t in info.msg_times if now - t < FAST_INTERVAL]
+        # 频率检测（节能优化：deque 滑动窗口，无临时列表）
+        while info.msg_times and now - info.msg_times[0] >= FAST_INTERVAL:
+            info.msg_times.popleft()
         info.msg_times.append(now)
         if len(info.msg_times) >= MAX_FREQ_COUNT:
             await self.kick(user_jid, nick, "发送过快")
@@ -182,10 +188,12 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         except Exception:
             return None
 
+    # 缓存清理（节能优化：增加 gc.collect()）
     async def clean_cache(self):
         while True:
             await asyncio.sleep(CLEAN_CACHE_TIME)
             self.users.clear()
+            gc.collect()                    # 强制回收，阻止内存缓慢增长
             logging.warning("缓存清理")
 
     def on_disconnect(self, event):
@@ -195,7 +203,7 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         logging.error("❌ 登录失败")
         self.disconnect()
 
-# ===== 主入口 =====
+# ===== 主入口（上线机制完全不变）=====
 async def run_bot():
     await start_http_server()
 
