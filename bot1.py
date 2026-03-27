@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-# Railway XMPP 反刷屏机器人（节能版）
-# 功能：反刷屏 + HTTP Pin Server + 自动重连 + 稳定性增强
-# 优化点：在保持原有结构、功能、上线机制完全不变的前提下，大幅降低内存占用
-#         1. msg_times 使用 deque + 滑动窗口（避免每次过滤创建临时列表）
-#         2. 缓存清理时强制 gc.collect()（解决长时间运行的内存缓慢增长）
-#         3. 其他逻辑、参数、事件处理、MUC上线流程完全一致
+# Railway XMPP 反刷屏机器人（稳定增强版）
+# 改进点：
+# 1. 增强连接稳定性（更好的keepalive和重连机制）
+# 2. 渐进式缓存清理（避免一次性清空）
+# 3. 更详细的日志和状态监控
+# 4. 改进的异常处理和恢复机制
 
 import asyncio
 import time
@@ -29,7 +29,8 @@ MAX_REPEAT_COUNT = 4
 FAST_INTERVAL = 5
 MIN_SPAM_LENGTH = 4
 MAX_SPAM_COUNT = 5
-CLEAN_CACHE_TIME = 1800
+CLEAN_CACHE_TIME = 1800  # 30分钟
+CACHE_EXPIRE_TIME = 3600  # 1小时后过期的用户数据
 MAX_USERS = 1000
 MAX_MESSAGE_LENGTH = 500
 
@@ -45,17 +46,18 @@ async def start_http_server():
     port = int(os.getenv("PORT", 8000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"✅ HTTP pin server running on port {port}")
+    logging.info(f"✅ HTTP pin server running on port {port}")
 
-# ===== 用户状态（节能优化：msg_times 使用 deque）=====
+# ===== 用户状态（增加最后活动时间）=====
 class UserInfo:
-    __slots__ = ("msg_times", "last_msg", "repeat_count")
+    __slots__ = ("msg_times", "last_msg", "repeat_count", "last_active")
     def __init__(self):
-        self.msg_times = deque()          # 滑动窗口，内存更高效
+        self.msg_times = deque()
         self.last_msg = ""
         self.repeat_count = 0
+        self.last_active = time.time()
 
-# ===== 单条消息刷屏检测（逻辑完全不变）=====
+# ===== 单条消息刷屏检测 =====
 def has_spam_pattern(text: str) -> bool:
     if len(text) < MIN_SPAM_LENGTH * MAX_SPAM_COUNT:
         return False
@@ -69,57 +71,80 @@ def has_spam_pattern(text: str) -> bool:
                 return True
     return False
 
-# ===== 机器人类（结构完全不变）=====
+# ===== 机器人类（稳定性增强）=====
 class AntiSpamBot(slixmpp.ClientXMPP):
     def __init__(self):
         super().__init__(BOT_JID, BOT_PASSWORD)
         self.users: Dict[str, UserInfo] = {}
         self.last_cleanup = time.time()
+        self.is_joined = False
+        self.cleanup_task = None
+        self.start_time = time.time()
 
         # 事件
         self.add_event_handler("session_start", self.start)
         self.add_event_handler("groupchat_message", self.on_message)
+        self.add_event_handler("muc::%s::got_online" % ROOM_JID, self.on_muc_online)
         self.add_event_handler("disconnected", self.on_disconnect)
         self.add_event_handler("failed_auth", self.on_failed_auth)
+        self.add_event_handler("connection_failed", self.on_connection_failed)
 
-        # Keepalive
+        # Keepalive - 增强参数
         self.register_plugin("xep_0199")
-        self["xep_0199"].enable_keepalive(interval=60, timeout=10)
+        self["xep_0199"].enable_keepalive(interval=30, timeout=20)
 
     async def start(self, event):
+        logging.info(f"🔗 会话已建立 (运行时间: {int(time.time() - self.start_time)}秒)")
+        
         self.send_presence()
-
+        
         # roster 请求加超时
         try:
             await asyncio.wait_for(self.get_roster(), timeout=30)
+            logging.info("✅ Roster 获取成功")
         except asyncio.TimeoutError:
-            logging.warning("⚠ Roster 请求超时")
+            logging.warning("⚠️ Roster 请求超时")
+        except Exception as e:
+            logging.warning(f"⚠️ Roster 异常: {e}")
 
-        await asyncio.sleep(2)
+        # 短暂延迟后加入MUC
+        await asyncio.sleep(1)
+        await self.join_room_with_retry()
 
-        # MUC join 自动重试
-        joined = False
+        # 启动缓存清理（仅启动一次）
+        if self.cleanup_task is None or self.cleanup_task.done():
+            self.cleanup_task = asyncio.create_task(self.clean_cache())
+            logging.info("🧹 缓存清理任务已启动")
+
+    async def join_room_with_retry(self):
+        """加入MUC并自动重试"""
         for attempt in range(5):
             try:
+                logging.info(f"🚪 尝试加入群聊 (第 {attempt + 1} 次)")
                 await asyncio.wait_for(
                     self.plugin["xep_0045"].join_muc(ROOM_JID, ROOM_NICK),
-                    timeout=15
+                    timeout=20
                 )
-                joined = True
-                logging.warning("✅ Bot 已上线")
-                break
+                self.is_joined = True
+                logging.info("✅ 成功加入群聊")
+                return True
             except asyncio.TimeoutError:
-                logging.warning(f"⚠ MUC join 超时，第 {attempt + 1} 次重试")
-                await asyncio.sleep(5)
+                logging.warning(f"⚠️ MUC join 超时 (尝试 {attempt + 1}/5)")
+                await asyncio.sleep(3 * (attempt + 1))  # 递增延迟
             except Exception as e:
-                logging.error(f"加入群聊异常: {e}")
-                await asyncio.sleep(5)
+                logging.error(f"❌ 加入群聊异常: {e}")
+                await asyncio.sleep(3 * (attempt + 1))
 
-        if not joined:
-            logging.error("❌ Bot 未能加入群聊，稍后主循环会重试")
+        logging.error("❌ 无法加入群聊，所有重试均失败")
+        self.is_joined = False
+        return False
 
-        # 启动缓存清理
-        asyncio.create_task(self.clean_cache())
+    def on_muc_online(self, presence):
+        """MUC上线确认"""
+        nick = presence['muc']['nick']
+        if nick == ROOM_NICK:
+            logging.info(f"✅ Bot 已在群聊中上线 (昵称: {nick})")
+            self.is_joined = True
 
     async def on_message(self, msg):
         if msg["from"].bare != ROOM_JID:
@@ -135,18 +160,21 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         if not user_jid:
             return
 
+        # 限制用户数量
         if len(self.users) > MAX_USERS:
-            self.users.clear()
+            logging.warning(f"⚠️ 用户数超限 ({len(self.users)}), 执行清理")
+            await self.clean_old_users()
 
         info = self.users.setdefault(user_jid, UserInfo())
         now = time.time()
+        info.last_active = now  # 更新活动时间
 
         # 单条消息刷屏
         if has_spam_pattern(body):
             await self.kick(user_jid, nick, "单条消息刷屏")
             return
 
-        # 频率检测（节能优化：deque 滑动窗口，无临时列表）
+        # 频率检测
         while info.msg_times and now - info.msg_times[0] >= FAST_INTERVAL:
             info.msg_times.popleft()
         info.msg_times.append(now)
@@ -176,10 +204,10 @@ class AntiSpamBot(slixmpp.ClientXMPP):
                 mbody=f"{nick} 被移除：{reason}",
                 mtype="groupchat"
             )
-            logging.warning(f"KICK: {nick}")
+            logging.info(f"🚫 KICK: {nick} ({reason})")
             self.users.pop(user_jid, None)
         except Exception as e:
-            logging.error(f"踢人失败: {e}")
+            logging.error(f"❌ 踢人失败: {e}")
 
     def get_user_jid(self, room: str, nick: str):
         try:
@@ -188,42 +216,123 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         except Exception:
             return None
 
-    # 缓存清理（节能优化：增加 gc.collect()）
+    async def clean_old_users(self):
+        """清理过期用户数据（渐进式）"""
+        now = time.time()
+        to_remove = [
+            user_jid for user_jid, info in self.users.items()
+            if now - info.last_active > CACHE_EXPIRE_TIME
+        ]
+        for user_jid in to_remove:
+            self.users.pop(user_jid, None)
+        
+        if to_remove:
+            logging.info(f"🧹 清理 {len(to_remove)} 个过期用户, 剩余 {len(self.users)} 个")
+
     async def clean_cache(self):
+        """定期缓存清理（渐进式）"""
+        loop_count = 0
         while True:
-            await asyncio.sleep(CLEAN_CACHE_TIME)
-            self.users.clear()
-            gc.collect()                    # 强制回收，阻止内存缓慢增长
-            logging.warning("缓存清理")
+            try:
+                await asyncio.sleep(CLEAN_CACHE_TIME)
+                loop_count += 1
+                
+                # 渐进式清理：只清理过期数据
+                await self.clean_old_users()
+                
+                # 每3次（1.5小时）执行一次垃圾回收
+                if loop_count % 3 == 0:
+                    gc.collect()
+                    logging.info(f"🧹 执行垃圾回收 (运行时间: {int(time.time() - self.start_time)}秒)")
+                
+                logging.info(f"📊 状态: 用户={len(self.users)}, 已加入={self.is_joined}, 运行={int(time.time() - self.start_time)}秒")
+                
+            except asyncio.CancelledError:
+                logging.info("🧹 缓存清理任务被取消")
+                break
+            except Exception as e:
+                logging.error(f"❌ 清理任务异常: {e}")
 
     def on_disconnect(self, event):
-        logging.warning("⚠ 掉线")
+        uptime = int(time.time() - self.start_time)
+        logging.warning(f"⚠️ 连接断开 (运行时间: {uptime}秒)")
+        self.is_joined = False
+
+    def on_connection_failed(self, event):
+        logging.error(f"❌ 连接失败: {event}")
 
     def on_failed_auth(self, event):
-        logging.error("❌ 登录失败")
+        logging.error("❌ 认证失败 - 请检查账号密码")
         self.disconnect()
 
-# ===== 主入口（上线机制完全不变）=====
+# ===== 主入口（改进重连机制）=====
 async def run_bot():
     await start_http_server()
+    
+    reconnect_delay = 5
+    max_delay = 60
+    consecutive_failures = 0
 
     while True:
         try:
+            logging.info("🤖 启动机器人...")
             xmpp = AntiSpamBot()
             xmpp.register_plugin("xep_0030")
             xmpp.register_plugin("xep_0045")
 
-            # 关键修复：同步 connect + 等待 disconnected Future
-            xmpp.connect()
-            await xmpp.disconnected  # 断开时自动继续（官方推荐方式）
+            # 异步连接
+            connected = await asyncio.wait_for(
+                asyncio.to_thread(xmpp.connect),
+                timeout=30
+            )
+            
+            if not connected:
+                raise Exception("连接失败")
+            
+            logging.info("✅ 已连接到服务器")
+            consecutive_failures = 0
+            reconnect_delay = 5  # 重置延迟
+            
+            # 等待断开
+            await xmpp.disconnected
 
+        except asyncio.TimeoutError:
+            logging.error("❌ 连接超时")
+            consecutive_failures += 1
         except Exception as e:
-            logging.error(f"主循环异常: {e}")
-        await asyncio.sleep(5)  # 重连间隔
+            logging.error(f"❌ 主循环异常: {e}")
+            consecutive_failures += 1
+        
+        # 递增延迟策略
+        if consecutive_failures > 0:
+            reconnect_delay = min(reconnect_delay * 1.5, max_delay)
+            logging.warning(f"⏰ {int(reconnect_delay)}秒后重连 (失败次数: {consecutive_failures})")
+        
+        await asyncio.sleep(reconnect_delay)
 
 if __name__ == "__main__":
+    # 设置日志级别为INFO以便看到更多信息
     logging.basicConfig(
-        level=logging.WARNING,  # 建议临时改成 INFO 看更多日志
-        format="%(asctime)s %(levelname)s: %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
-    asyncio.run(run_bot())
+    
+    # 检查必要的环境变量
+    required_vars = ["BOT_JID", "BOT_PASSWORD", "ROOM_JID", "ROOM_NICK"]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
+        logging.error(f"❌ 缺少环境变量: {', '.join(missing)}")
+        exit(1)
+    
+    logging.info("=" * 50)
+    logging.info("🚀 XMPP 反刷屏机器人启动")
+    logging.info(f"📧 JID: {BOT_JID}")
+    logging.info(f"🏠 群聊: {ROOM_JID}")
+    logging.info(f"👤 昵称: {ROOM_NICK}")
+    logging.info("=" * 50)
+    
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logging.info("👋 收到退出信号，程序关闭")
