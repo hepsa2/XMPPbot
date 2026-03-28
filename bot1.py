@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 # Railway XMPP 反刷屏机器人（稳定增强版）
 # 改进点：
-# 1. 增强连接稳定性（更好的keepalive和重连机制）
-# 2. 渐进式缓存清理（避免一次性清空）
-# 3. 更详细的日志和状态监控
-# 4. 改进的异常处理和恢复机制
+# 1. 优化 keepalive（降低频率 + whitespace keepalive）
+# 2. 添加自定义异常处理器，过滤 socket.send() 警告
+# 3. 增强日志记录，便于诊断连接问题
+# 4. 保持原有结构和反刷屏逻辑完全不变
 
 import asyncio
 import time
@@ -71,6 +71,16 @@ def has_spam_pattern(text: str) -> bool:
                 return True
     return False
 
+# ===== 自定义异常处理器：过滤 socket.send() 警告 =====
+def custom_exception_handler(loop, context):
+    message = context.get('message', '')
+    if 'socket.send() raised exception' in message or 'socket.send' in message:
+        # 降级为 debug，避免日志刷屏，但仍记录
+        logging.debug(f"忽略 socket.send 异常（连接短暂不稳定）: {context.get('exception')}")
+        return
+    # 其他异常走默认处理
+    loop.default_exception_handler(context)
+
 # ===== 机器人类（稳定性增强）=====
 class AntiSpamBot(slixmpp.ClientXMPP):
     def __init__(self):
@@ -89,16 +99,19 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         self.add_event_handler("failed_auth", self.on_failed_auth)
         self.add_event_handler("connection_failed", self.on_connection_failed)
 
-        # Keepalive - 增强参数
+        # Keepalive 配置优化
         self.register_plugin("xep_0199")
-        self["xep_0199"].enable_keepalive(interval=30, timeout=20)
+        self["xep_0199"].enable_keepalive(interval=60, timeout=40)  # 降低频率
+
+        # 启用 whitespace keepalive（更轻量）
+        self.whitespace_keepalive = True
+        self.whitespace_keepalive_interval = 60
 
     async def start(self, event):
         logging.info(f"🔗 会话已建立 (运行时间: {int(time.time() - self.start_time)}秒)")
         
         self.send_presence()
         
-        # roster 请求加超时
         try:
             await asyncio.wait_for(self.get_roster(), timeout=30)
             logging.info("✅ Roster 获取成功")
@@ -107,17 +120,14 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         except Exception as e:
             logging.warning(f"⚠️ Roster 异常: {e}")
 
-        # 短暂延迟后加入MUC
         await asyncio.sleep(1)
         await self.join_room_with_retry()
 
-        # 启动缓存清理（仅启动一次）
         if self.cleanup_task is None or self.cleanup_task.done():
             self.cleanup_task = asyncio.create_task(self.clean_cache())
             logging.info("🧹 缓存清理任务已启动")
 
     async def join_room_with_retry(self):
-        """加入MUC并自动重试"""
         for attempt in range(5):
             try:
                 logging.info(f"🚪 尝试加入群聊 (第 {attempt + 1} 次)")
@@ -130,7 +140,7 @@ class AntiSpamBot(slixmpp.ClientXMPP):
                 return True
             except asyncio.TimeoutError:
                 logging.warning(f"⚠️ MUC join 超时 (尝试 {attempt + 1}/5)")
-                await asyncio.sleep(3 * (attempt + 1))  # 递增延迟
+                await asyncio.sleep(3 * (attempt + 1))
             except Exception as e:
                 logging.error(f"❌ 加入群聊异常: {e}")
                 await asyncio.sleep(3 * (attempt + 1))
@@ -140,7 +150,6 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         return False
 
     def on_muc_online(self, presence):
-        """MUC上线确认"""
         nick = presence['muc']['nick']
         if nick == ROOM_NICK:
             logging.info(f"✅ Bot 已在群聊中上线 (昵称: {nick})")
@@ -160,21 +169,18 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         if not user_jid:
             return
 
-        # 限制用户数量
         if len(self.users) > MAX_USERS:
             logging.warning(f"⚠️ 用户数超限 ({len(self.users)}), 执行清理")
             await self.clean_old_users()
 
         info = self.users.setdefault(user_jid, UserInfo())
         now = time.time()
-        info.last_active = now  # 更新活动时间
+        info.last_active = now
 
-        # 单条消息刷屏
         if has_spam_pattern(body):
             await self.kick(user_jid, nick, "单条消息刷屏")
             return
 
-        # 频率检测
         while info.msg_times and now - info.msg_times[0] >= FAST_INTERVAL:
             info.msg_times.popleft()
         info.msg_times.append(now)
@@ -182,7 +188,6 @@ class AntiSpamBot(slixmpp.ClientXMPP):
             await self.kick(user_jid, nick, "发送过快")
             return
 
-        # 连续重复检测
         if body == info.last_msg:
             info.repeat_count += 1
         else:
@@ -217,7 +222,6 @@ class AntiSpamBot(slixmpp.ClientXMPP):
             return None
 
     async def clean_old_users(self):
-        """清理过期用户数据（渐进式）"""
         now = time.time()
         to_remove = [
             user_jid for user_jid, info in self.users.items()
@@ -230,17 +234,14 @@ class AntiSpamBot(slixmpp.ClientXMPP):
             logging.info(f"🧹 清理 {len(to_remove)} 个过期用户, 剩余 {len(self.users)} 个")
 
     async def clean_cache(self):
-        """定期缓存清理（渐进式）"""
         loop_count = 0
         while True:
             try:
                 await asyncio.sleep(CLEAN_CACHE_TIME)
                 loop_count += 1
                 
-                # 渐进式清理：只清理过期数据
                 await self.clean_old_users()
                 
-                # 每3次（1.5小时）执行一次垃圾回收
                 if loop_count % 3 == 0:
                     gc.collect()
                     logging.info(f"🧹 执行垃圾回收 (运行时间: {int(time.time() - self.start_time)}秒)")
@@ -280,7 +281,6 @@ async def run_bot():
             xmpp.register_plugin("xep_0030")
             xmpp.register_plugin("xep_0045")
 
-            # 异步连接
             connected = await asyncio.wait_for(
                 asyncio.to_thread(xmpp.connect),
                 timeout=30
@@ -291,19 +291,17 @@ async def run_bot():
             
             logging.info("✅ 已连接到服务器")
             consecutive_failures = 0
-            reconnect_delay = 5  # 重置延迟
+            reconnect_delay = 5
             
-            # 等待断开
             await xmpp.disconnected
 
         except asyncio.TimeoutError:
             logging.error("❌ 连接超时")
             consecutive_failures += 1
         except Exception as e:
-            logging.error(f"❌ 主循环异常: {e}")
+            logging.error(f"❌ 主循环异常: {type(e).__name__}: {e}", exc_info=True)
             consecutive_failures += 1
         
-        # 递增延迟策略
         if consecutive_failures > 0:
             reconnect_delay = min(reconnect_delay * 1.5, max_delay)
             logging.warning(f"⏰ {int(reconnect_delay)}秒后重连 (失败次数: {consecutive_failures})")
@@ -311,14 +309,17 @@ async def run_bot():
         await asyncio.sleep(reconnect_delay)
 
 if __name__ == "__main__":
-    # 设置日志级别为INFO以便看到更多信息
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
     
-    # 检查必要的环境变量
+    # 设置自定义异常处理器
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.set_exception_handler(custom_exception_handler)
+    
     required_vars = ["BOT_JID", "BOT_PASSWORD", "ROOM_JID", "ROOM_NICK"]
     missing = [var for var in required_vars if not os.getenv(var)]
     if missing:
