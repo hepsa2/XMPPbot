@@ -4,7 +4,8 @@
 > 使用pin服务+Railway免费计划
 > 长期稳定上线，掉线自动重连
 
-
+**如果使用cloudflare worker做ping**<br>
+还需要settings→Trigger Events→cron,填写```*/8 * * * *```
 ## 准备工作
 - 匿名非临时邮箱
 - 注册github账号（最好开启2fa验证，F-droid下载Aegis即可获取验证码）
