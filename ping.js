@@ -1,13 +1,13 @@
 /**
  * XMPP Bot Keep-Alive Worker
- * 目标: https://xmpp-bot-production-9353.up.railway.app/ping
+ * 目标: https://xxxxc.up.railway.app/ping
  *
  * 策略：每 8 分钟触发一次 Cron，加入 0~90 秒随机抖动，
  *       制造不定时效果；失败自动重试一次。
  *       夜间（00:00-06:00 UTC+8）降频至 50% 概率跳过，节省额度。
  */
 
-const TARGET_URL  = "https://xmpp-bot-production-9353.up.railway.app/ping";
+const TARGET_URL  = "https://xmppbot-production.up.railway.app/ping";
 const TIMEOUT_MS  = 8_000;   // 单次请求超时
 const JITTER_MAX  = 90_000;  // 最大随机延迟（毫秒）
 const NIGHT_START = 16;      // UTC 16:00 = SGT/CST 00:00
