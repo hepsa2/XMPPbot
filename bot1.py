@@ -8,11 +8,13 @@
 # 5. keepalive 间隔放宽至 120 秒，减少心跳流量
 # 6. deque 加 maxlen 限制，防止极端情况内存膨胀
 # 7. 重连时主动 del + gc，彻底释放旧实例内存
+# 8. [修复] 用 _tasks 列表统一追踪所有后台 Task，断连时全部取消，
+#    防止 session_start 竞态导致多个 clean_cache 僵尸 Task 并发运行
 
 import asyncio
 import time
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import os
 import gc
 from collections import deque
@@ -27,15 +29,15 @@ ROOM_JID      = os.getenv("ROOM_JID")
 ROOM_NICK     = os.getenv("ROOM_NICK")
 
 # ========== 反刷屏参数 ==========
-MAX_FREQ_COUNT    = 5     # N 秒内最多发几条
-MAX_REPEAT_COUNT  = 4     # 重复消息最多几次
-FAST_INTERVAL     = 5     # 频率检测窗口（秒）
-MIN_SPAM_LENGTH   = 4     # 单条刷屏检测最短子串
-MAX_SPAM_COUNT    = 5     # 子串重复次数阈值
-CLEAN_CACHE_TIME  = 1800  # 缓存清理间隔（秒）
-CACHE_EXPIRE_TIME = 3600  # 用户数据过期时间（秒）
-MAX_USERS         = 1000  # 最大缓存用户数
-MAX_MESSAGE_LENGTH= 500   # 忽略超长消息
+MAX_FREQ_COUNT    = 5
+MAX_REPEAT_COUNT  = 4
+FAST_INTERVAL     = 5
+MIN_SPAM_LENGTH   = 4
+MAX_SPAM_COUNT    = 5
+CLEAN_CACHE_TIME  = 1800
+CACHE_EXPIRE_TIME = 3600
+MAX_USERS         = 1000
+MAX_MESSAGE_LENGTH= 500
 
 
 # ===== HTTP Ping Server（防 Railway 休眠）=====
@@ -57,7 +59,6 @@ async def start_http_server():
 class UserInfo:
     __slots__ = ("msg_times", "last_msg", "repeat_count", "last_active")
     def __init__(self):
-        # ✅ 优化：加 maxlen，防止极端情况下 deque 无限增长占用内存
         self.msg_times    = deque(maxlen=MAX_FREQ_COUNT + 1)
         self.last_msg     = ""
         self.repeat_count = 0
@@ -93,11 +94,14 @@ class AntiSpamBot(slixmpp.ClientXMPP):
     def __init__(self):
         super().__init__(BOT_JID, BOT_PASSWORD)
         self.users: Dict[str, UserInfo] = {}
-        self.is_joined    = False
-        self.cleanup_task: Optional[asyncio.Task] = None
-        self.start_time   = time.time()
+        self.is_joined  = False
+        self.start_time = time.time()
 
-        # ✅ 关键修复：禁用内置自动重连，完全由外层 while True 统一管理
+        # ★ 核心修复：用列表统一追踪本实例创建的所有后台 Task
+        #   断连时调用 _cancel_all_tasks() 一次性全部取消，
+        #   彻底防止"僵尸 Task"在下次 session_start 后继续运行
+        self._tasks: List[asyncio.Task] = []
+
         self.auto_reconnect = False
 
         self.add_event_handler("session_start",     self.on_session_start)
@@ -109,13 +113,33 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         self.add_event_handler("failed_auth",       self.on_failed_auth)
         self.add_event_handler("connection_failed", self.on_connection_failed)
 
-        # ✅ 优化：只保留 xep_0199 心跳，去掉冗余的 whitespace_keepalive
-        #         间隔放宽至 120 秒，减少不必要的心跳流量
         self.register_plugin("xep_0199")
         self["xep_0199"].enable_keepalive(interval=120, timeout=60)
 
+    # ── Task 管理：统一创建 & 取消 ────────────────────────────
+    def _create_task(self, coro) -> asyncio.Task:
+        """创建 Task 并登记到本实例的追踪列表，替代裸 asyncio.create_task。"""
+        task = asyncio.ensure_future(coro)
+        self._tasks.append(task)
+        # Task 完成后自动从列表移除，避免列表无限增长
+        task.add_done_callback(
+            lambda t: self._tasks.remove(t) if t in self._tasks else None
+        )
+        return task
+
+    def _cancel_all_tasks(self):
+        """取消本实例所有尚未完成的后台 Task。"""
+        active = [t for t in self._tasks if not t.done()]
+        if active:
+            logging.info(f"正在取消 {len(active)} 个后台任务…")
+        for task in active:
+            task.cancel()
+        self._tasks.clear()
+
+    # ── 启动 ──────────────────────────────────────────────────
     async def on_session_start(self, event):
-        # ✅ 幂等保护：已加入时跳过，防止 slixmpp 内部重复触发
+        # ★ 幂等守卫：is_joined 为 True 说明本实例已完成初始化，
+        #   直接跳过，彻底堵死 session_start 重复触发的竞态窗口
         if self.is_joined:
             logging.warning("⚠️ on_session_start 重复触发，跳过")
             return
@@ -124,17 +148,12 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         logging.info(f"🔗 会话已建立 (运行时间: {uptime}秒)")
         self.send_presence()
 
-        # ✅ 优化：群聊机器人不需要 Roster，去除该请求节省重连流量
-
         await asyncio.sleep(1)
         await self.join_room_with_retry()
 
-        # ✅ 幂等保护：确保全局只有一个清理任务运行
-        if self.cleanup_task is None or self.cleanup_task.done():
-            self.cleanup_task = asyncio.create_task(self.clean_cache())
-            logging.info("🧹 缓存清理任务已启动")
-        else:
-            logging.info("🧹 缓存清理任务已存在，跳过")
+        # ★ 使用 _create_task 替代 asyncio.create_task，Task 受实例统一管理
+        self._create_task(self.clean_cache())
+        logging.info("🧹 缓存清理任务已启动")
 
     async def join_room_with_retry(self):
         for attempt in range(5):
@@ -185,12 +204,10 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         now  = time.time()
         info.last_active = now
 
-        # 检查单条刷屏
         if has_spam_pattern(body):
             await self.kick(user_jid, nick, "单条消息刷屏")
             return
 
-        # 检查发送频率（仍需手动过滤超出时间窗口的记录）
         while info.msg_times and now - info.msg_times[0] >= FAST_INTERVAL:
             info.msg_times.popleft()
         info.msg_times.append(now)
@@ -198,7 +215,6 @@ class AntiSpamBot(slixmpp.ClientXMPP):
             await self.kick(user_jid, nick, "发送过快")
             return
 
-        # 检查重复消息
         if body == info.last_msg:
             info.repeat_count += 1
         else:
@@ -261,16 +277,16 @@ class AntiSpamBot(slixmpp.ClientXMPP):
                 )
             except asyncio.CancelledError:
                 logging.info("🧹 缓存清理任务已取消")
-                break
+                raise
             except Exception as e:
                 logging.error(f"❌ 清理任务异常: {e}")
 
     def on_disconnect(self, event):
         uptime = int(time.time() - self.start_time)
         logging.warning(f"⚠️ 连接断开 (运行时间: {uptime}秒)")
+        # ★ 核心修复：断连时立即取消本实例所有 Task，防止"僵尸 Task"
+        self._cancel_all_tasks()
         self.is_joined = False
-        if self.cleanup_task and not self.cleanup_task.done():
-            self.cleanup_task.cancel()
 
     def on_connection_failed(self, event):
         logging.error(f"❌ 连接失败: {event}")
@@ -280,7 +296,8 @@ class AntiSpamBot(slixmpp.ClientXMPP):
         self.disconnect()
 
     def safe_disconnect(self):
-        """安全断开，忽略已断开时的异常"""
+        # ★ 主动断连时也先取消所有 Task，再执行 XMPP 层断连
+        self._cancel_all_tasks()
         try:
             if self.is_connected():
                 self.disconnect()
@@ -312,7 +329,6 @@ async def run_bot():
             consecutive_failures = 0
             reconnect_delay      = 5.0
 
-            # 阻塞直到本次连接完全断开
             await bot.disconnected
 
         except ConnectionError as e:
@@ -332,7 +348,6 @@ async def run_bot():
             consecutive_failures += 1
 
         finally:
-            # ✅ 保证旧实例完全销毁后再重连，防止双实例并发
             if bot:
                 bot.safe_disconnect()
                 await asyncio.sleep(2)
